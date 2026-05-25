@@ -1297,6 +1297,16 @@ describe('Codex skill', () => {
     expect(content).toContain('codex exec resume');
   });
 
+  test('codex/SKILL.md resume command only uses resume-supported flags', () => {
+    const content = fs.readFileSync(path.join(ROOT, 'codex', 'SKILL.md'), 'utf-8');
+    const match = content.match(/codex exec resume[^\n]+/);
+    expect(match).not.toBeNull();
+    const resumeCommand = match![0];
+    expect(resumeCommand).not.toContain(' -C ');
+    expect(resumeCommand).not.toContain(' -s read-only');
+    expect(resumeCommand).toContain("-c 'sandbox_mode=\"read-only\"'");
+  });
+
   test('codex/SKILL.md contains cost tracking', () => {
     const content = fs.readFileSync(path.join(ROOT, 'codex', 'SKILL.md'), 'utf-8');
     expect(content).toContain('tokens used');
@@ -1315,10 +1325,14 @@ describe('Codex skill', () => {
     expect(content).toContain('gstack-review-log');
   });
 
-  test('codex/SKILL.md uses which for binary discovery, not hardcoded path', () => {
+  test('codex/SKILL.md uses command -v for binary discovery, not hardcoded path', () => {
     const content = fs.readFileSync(path.join(ROOT, 'codex', 'SKILL.md'), 'utf-8');
-    expect(content).toContain('which codex');
+    expect(content).toContain('command -v codex');
     expect(content).not.toContain('/opt/homebrew/bin/codex');
+    // Defensive: catch any future regression that reintroduces `which codex`,
+    // which fails in environments where `which` isn't on PATH (some Windows
+    // shells, BusyBox-only containers). #1197.
+    expect(content).not.toContain('which codex');
   });
 
   test('codex/SKILL.md contains error handling for missing binary and auth', () => {
@@ -1330,6 +1344,17 @@ describe('Codex skill', () => {
   test('codex/SKILL.md uses mktemp for temp files', () => {
     const content = fs.readFileSync(path.join(ROOT, 'codex', 'SKILL.md'), 'utf-8');
     expect(content).toContain('mktemp');
+  });
+
+  test('codex JSON stream parser uses portable Python discovery', () => {
+    const files = ['codex/SKILL.md.tmpl', 'codex/SKILL.md'];
+
+    for (const rel of files) {
+      const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
+      expect(content).toContain('PYTHON_CMD=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)');
+      expect(content).toContain('PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c');
+      expect(content).not.toContain('PYTHONUNBUFFERED=1 python3 -u -c');
+    }
   });
 
   test('adversarial review in /review always runs both passes', () => {
@@ -1400,6 +1425,29 @@ describe('Codex skill', () => {
     expect(content).toContain('codex exec');
   });
 
+  test('codex review invocations avoid the prompt plus --base argument shape', () => {
+    for (const rel of ['codex/SKILL.md', 'review/SKILL.md', 'ship/SKILL.md']) {
+      const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
+      expect(content).not.toContain('--base <base> -c \'model_reasoning_effort="high"\'');
+      expect(content).toContain('Run git diff origin/<base>...HEAD 2>/dev/null || git diff <base>...HEAD');
+    }
+  });
+
+  test('codex review prompts always carry the filesystem boundary (#1503/#1522 regression)', () => {
+    // Pre-#1209, the bare `codex review --base` path stripped the filesystem
+    // boundary instruction, letting Codex spend tokens reading skill files.
+    // #1209's prompt rewrite restored the boundary by routing every default
+    // call through a prompt. Pin both halves so a future refactor can't
+    // regress: (a) the boundary line must appear, (b) the call must be
+    // through `codex review "<prompt>"` not bare `codex review --base`.
+    const boundaryLine =
+      'Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/';
+    for (const rel of ['codex/SKILL.md', 'review/SKILL.md', 'ship/SKILL.md']) {
+      const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
+      expect(content).toContain(boundaryLine);
+    }
+  });
+
   test('/review persists a review-log entry for ship readiness', () => {
     const content = fs.readFileSync(path.join(ROOT, 'review', 'SKILL.md'), 'utf-8');
     expect(content).toContain('"skill":"review"');
@@ -1456,6 +1504,107 @@ describe('Skill trigger phrases', () => {
       expect(frontmatter).toMatch(/Proactively (suggest|invoke)/i);
     });
   }
+});
+
+// ─── Private-path leak detector ──────────────────────────────
+//
+// Catches accidental references to maintainer-private files in skill output.
+// Adapted from the McGluut fork's skill-contract-audit.ts (we don't take the
+// whole script — these are the unique checks not already covered by
+// test/gen-skill-docs.test.ts:1668-2074 .claude/skills leakage tests).
+
+describe('Private-path leak detection', () => {
+  const PRIVATE_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /coordination-board\.md/i, label: 'coordination-board.md' },
+    { pattern: /SEEKING_LOG\.md/, label: 'SEEKING_LOG.md' },
+    { pattern: /RATIONAL_SUBJECT\.md/, label: 'RATIONAL_SUBJECT.md' },
+    { pattern: /VALUE_SIGNAL_LOOP\.md/, label: 'VALUE_SIGNAL_LOOP.md' },
+    { pattern: /C:\\\\LLM Playground\\\\go/i, label: 'C:\\LLM Playground\\go' },
+  ];
+
+  // Walk every SKILL.md and SKILL.md.tmpl in the repo (excluding node_modules,
+  // generated host outputs, and .git).
+  function discoverSkillSurface(): string[] {
+    const results: string[] = [];
+    function walk(dir: string) {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.') && entry.name !== '.agents') continue;
+        if (entry.name === 'node_modules' || entry.name === 'dist') continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else if (entry.name === 'SKILL.md' || entry.name === 'SKILL.md.tmpl') {
+          results.push(full);
+        }
+      }
+    }
+    walk(ROOT);
+    return results;
+  }
+
+  test('no SKILL.md or SKILL.md.tmpl references private maintainer files', () => {
+    const files = discoverSkillSurface();
+    expect(files.length).toBeGreaterThan(0);
+    const leaks: string[] = [];
+    for (const file of files) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const { pattern, label } of PRIVATE_PATTERNS) {
+        if (pattern.test(content)) {
+          leaks.push(`${path.relative(ROOT, file)} mentions ${label}`);
+        }
+      }
+    }
+    expect(leaks).toEqual([]);
+  });
+});
+
+// ─── Doc-inventory cross-check ───────────────────────────────
+//
+// Every skill directory (with a SKILL.md.tmpl) must appear in both AGENTS.md
+// and docs/skills.md. Catches the inventory drift codex flagged (/debug
+// → /investigate; missing /autoplan, /context-save, /plan-devex-review, etc.).
+
+describe('Doc inventory cross-check', () => {
+  // Skills that don't get user-invocation lines in agent-facing docs.
+  // - 'qa-only' is a sub-mode of /qa with shared docs.
+  // - The 5 listed below are infrastructure (model overlays, shipped binary,
+  //   hosts) that don't show up in the user-facing skill table.
+  const DOC_INVENTORY_EXCLUDE = new Set([
+    // Infra / non-skills
+    'agents', 'claude', 'connect-chrome', 'contrib', 'hosts',
+    'lib', 'model-overlays', 'openclaw', 'supabase', 'scripts', 'test',
+  ]);
+
+  function discoverSkillDirs(): string[] {
+    const dirs: string[] = [];
+    for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('.')) continue;
+      if (DOC_INVENTORY_EXCLUDE.has(entry.name)) continue;
+      const tmplPath = path.join(ROOT, entry.name, 'SKILL.md.tmpl');
+      if (fs.existsSync(tmplPath)) dirs.push(entry.name);
+    }
+    return dirs.sort();
+  }
+
+  test('every skill is documented in AGENTS.md', () => {
+    const agents = fs.readFileSync(path.join(ROOT, 'AGENTS.md'), 'utf-8');
+    const missing: string[] = [];
+    for (const skill of discoverSkillDirs()) {
+      // Match `/skill-name` as a token boundary.
+      if (!new RegExp(`/${skill}\\b`).test(agents)) missing.push(skill);
+    }
+    expect(missing).toEqual([]);
+  });
+
+  test('every skill is documented in docs/skills.md', () => {
+    const docs = fs.readFileSync(path.join(ROOT, 'docs', 'skills.md'), 'utf-8');
+    const missing: string[] = [];
+    for (const skill of discoverSkillDirs()) {
+      if (!new RegExp(`/${skill}\\b`).test(docs)) missing.push(skill);
+    }
+    expect(missing).toEqual([]);
+  });
 });
 
 // ─── Codex Skill Validation ──────────────────────────────────
